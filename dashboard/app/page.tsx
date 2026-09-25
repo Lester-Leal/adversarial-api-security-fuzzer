@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -148,6 +148,43 @@ function VulnRow({ report }: { report: VulnReport }) {
   );
 }
 
+// ── Latest-run banner ─────────────────────────────────────────────────────────
+
+function LatestRunBanner({ summary }: { summary: ScanResult }) {
+  const allClear = summary.summary.confirmed === 0;
+  return (
+    <div className={`rounded-xl border px-5 py-3 flex flex-wrap items-center gap-4 text-sm ${
+      allClear
+        ? "bg-green-950/40 border-green-700"
+        : "bg-red-950/40 border-red-700"
+    }`}>
+      <span className="text-lg">{allClear ? "✅" : "⚠️"}</span>
+      <div className="flex-1 min-w-0">
+        <span className="font-semibold text-gray-200">
+          Latest run:&nbsp;
+        </span>
+        <span className="font-mono text-xs text-gray-400">{summary.runId}</span>
+      </div>
+      <div className="flex gap-4 text-xs font-mono flex-wrap">
+        <span className="text-gray-400">
+          Attacks: <span className="text-gray-200 font-bold">{summary.summary.totalAttacks}</span>
+        </span>
+        <span className={allClear ? "text-green-400 font-bold" : "text-red-400 font-bold"}>
+          Confirmed: {summary.summary.confirmed}
+        </span>
+        {Object.entries(summary.summary.bySeverity).map(([sev, count]) => (
+          <span key={sev} className="text-yellow-400">
+            {sev}: {count}
+          </span>
+        ))}
+        <span className="text-gray-500">
+          {new Date(summary.startedAt).toLocaleString()}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
@@ -160,8 +197,19 @@ export default function Dashboard() {
   const [scanResult,  setScanResult]  = useState<ScanResult  | null>(null);
   const [logsResult,  setLogsResult]  = useState<LogsResult  | null>(null);
   const [patchResult, setPatchResult] = useState<PatchResult | null>(null);
+  const [latestRun,   setLatestRun]   = useState<ScanResult  | null>(null);
 
   const [error, setError] = useState<string | null>(null);
+
+  // Auto-fetch the latest log on mount so the banner populates immediately
+  useEffect(() => {
+    fetch("/api/logs")
+      .then((r) => r.ok ? r.json() : null)
+      .then((data: LogsResult | null) => {
+        if (data?.summary) setLatestRun(data.summary);
+      })
+      .catch(() => {/* server not running yet — silent */});
+  }, []);
 
   // The results panel shows either live scan data or fetched log data
   const activeResult: ScanResult | null =
@@ -182,6 +230,7 @@ export default function Dashboard() {
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       const data = (await res.json()) as ScanResult;
       setScanResult(data);
+      setLatestRun(data);          // keep banner current after live scan
       setScanStatus("success");
     } catch (e) {
       setError(String(e));
@@ -198,6 +247,7 @@ export default function Dashboard() {
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
       const data = (await res.json()) as LogsResult;
       setLogsResult(data);
+      if (data.summary) setLatestRun(data.summary); // keep banner current after log fetch
       setLogsStatus("success");
     } catch (e) {
       setError(String(e));
@@ -250,6 +300,9 @@ export default function Dashboard() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+
+        {/* ── Latest Run Banner ── */}
+        {latestRun && <LatestRunBanner summary={latestRun} />}
 
         {/* ── Target & Controls ── */}
         <section className="bg-gray-900 rounded-2xl border border-gray-800 p-6">
