@@ -8,6 +8,8 @@
     "target": "tsx --tsconfig tsconfig.json target-api/src/server.ts",
     "fuzzer": "tsx --tsconfig tsconfig.json fuzzer/src/orchestrator/index.ts",
     "verify": "tsx --tsconfig tsconfig.json fuzzer/src/orchestrator/verify.ts",
+    "ui": "tsx --tsconfig tsconfig.json fuzzer/src/ui-server.ts",
+    "dashboard": "cd dashboard && npm run dev",
     "dev": "concurrently \"npm run target\" \"npm run fuzzer\"",
     "build": "tsc --project tsconfig.json",
     "lint": "eslint . --ext .ts",
@@ -15,6 +17,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@fastify/cors": "^11.3.0",
     "@fastify/jwt": "^9.0.0",
     "@fastify/sensible": "^6.0.0",
     "@libsql/client": "^0.14.0",

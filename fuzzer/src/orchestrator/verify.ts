@@ -98,110 +98,126 @@ function parseDiffVulnClasses(diffContent: string): Set<string> {
 }
 
 // ── Phase 2a: Source mutations ────────────────────────────────────────────────
+//
+// Each RegexMutation matches code STRUCTURE rather than exact text.
+// Patterns use \s+ in place of every whitespace span so they survive
+// re-formatting, comment edits, and line-ending changes.
+//
+// `replace` is a string passed to String.prototype.replace(regex, replace).
+// Use $& to reference the matched text where needed.
+//
+// All patterns are idempotent: they only match the VULNERABLE form, so running
+// verify twice on an already-patched file is a safe no-op.
 
-interface SourceMutation {
+interface RegexMutation {
   description: string;
-  search: string;
+  /** Regex that matches the vulnerable code region. Use the `s` (dotAll) flag for multi-line spans. */
+  pattern: RegExp;
+  /** Replacement string (may reference capture groups $1, $2 …). */
   replace: string;
 }
 
-const MUTATIONS: Record<string, SourceMutation> = {
+const MUTATIONS: Record<string, RegexMutation> = {
+  // ── IDOR ───────────────────────────────────────────────────────────────────
+  // Matches the GET /notes/:id handler body that returns the note without an
+  // ownership check.  Anchored to the 404 guard + bare reply.send(note) line.
   IDOR: {
     description: "IDOR → ownership check on GET /notes/:id",
-    search:
-`    if (!note) return reply.code(404).send({ error: "Not found" });
-    return reply.send(note); // any authenticated user gets any note`,
-    replace:
-`    if (!note) return reply.code(404).send({ error: "Not found" });
-    // [PATCHED] Ownership check to prevent IDOR
-    const currentUser = req.user as { id: number };
-    if (note.ownerId !== currentUser.id) {
-      return reply.code(403).send({ error: "Forbidden" });
-    }
-    return reply.send(note);`,
+    pattern: new RegExp(
+      // Capture leading whitespace so we can re-indent the replacement.
+      `([ \\t]*)if\\s*\\(!note\\)\\s*return\\s+reply\\.code\\(404\\)[^;]+;\\s*` +
+      `return\\s+reply\\.send\\(note\\);[^\\n]*`,
+      "g"
+    ),
+    replace: [
+      "$1if (!note) return reply.code(404).send({ error: \"Not found\" });",
+      "$1// [PATCHED] Ownership check to prevent IDOR",
+      "$1const currentUser = req.user as { id: number };",
+      "$1if (note.ownerId !== currentUser.id) {",
+      "$1  return reply.code(403).send({ error: \"Forbidden\" });",
+      "$1}",
+      "$1return reply.send(note);",
+    ].join("\n"),
   },
 
+  // ── MASS_ASSIGNMENT ────────────────────────────────────────────────────────
+  // Matches the destructuring that pulls `isAdmin` from req.body inside the
+  // /register handler, plus the .values() call that spreads isAdmin.
   MASS_ASSIGNMENT: {
-    description: "MASS_ASSIGNMENT → strip isAdmin from POST /register",
-    search:
-`  // VULN-01 + VULN-07: no hashing, mass-assignment of isAdmin
-  app.post("/register", async (req, reply) => {
-    const { username, password, isAdmin } = req.body as {
-      username: string;
-      password: string;
-      isAdmin?: boolean;
-    };
-    const [user] = await db
-      .insert(users)
-      .values({ username, password, isAdmin: isAdmin ?? false, apiKey: \`key-\${Math.random()}\` })
-      .returning();`,
-    replace:
-`  // [PATCHED] Allowlist — isAdmin is NEVER accepted from the request body
-  app.post("/register", async (req, reply) => {
-    const { username, password } = req.body as {
-      username: string;
-      password: string;
-    };
-    const [user] = await db
-      .insert(users)
-      .values({ username, password, isAdmin: false, apiKey: \`key-\${Math.random()}\` })
-      .returning();`,
+    description: "MASS_ASSIGNMENT → strip isAdmin from POST /register body",
+    pattern: new RegExp(
+      // Destructure line that includes isAdmin
+      `([ \\t]*)const\\s*\\{\\s*username\\s*,\\s*password\\s*,\\s*isAdmin\\s*\\}` +
+      `\\s*=\\s*req\\.body\\s+as\\s+\\{[^}]+isAdmin\\?\\s*:\\s*boolean[^}]*\\};`,
+      "gs"
+    ),
+    replace: [
+      "$1// [PATCHED] Allowlist — isAdmin stripped from request body",
+      "$1const { username, password } = req.body as {",
+      "$1  username: string;",
+      "$1  password: string;",
+      "$1};",
+    ].join("\n"),
   },
 
+  // The isAdmin field in .values() must also be fixed — separate pattern so
+  // it applies even when the destructure line was already cleaned up.
+  MASS_ASSIGNMENT_VALUES: {
+    description: "MASS_ASSIGNMENT → force isAdmin:false in .values()",
+    pattern: new RegExp(
+      `isAdmin\\s*:\\s*isAdmin\\s*\\?\\?\\s*false`,
+      "g"
+    ),
+    replace: "isAdmin: false",
+  },
+
+  // ── AUTH_BYPASS ────────────────────────────────────────────────────────────
+  // Matches app.get("/users", async ... without an onRequest hook.
   AUTH_BYPASS: {
-    description: "AUTH_BYPASS → add onRequest auth hook to GET /users",
-    search:
-`  // VULN-02 + VULN-03: no auth, returns all columns including apiKey
-  app.get("/users", async (_req, reply) => {`,
-    replace:
-`  // [PATCHED] Require authentication on GET /users
-  app.get("/users", { onRequest: [app.authenticate] }, async (_req, reply) => {`,
+    description: "AUTH_BYPASS → add onRequest auth guard to GET /users",
+    pattern: new RegExp(
+      `([ \\t]*)app\\.get\\(\\s*"/users"\\s*,\\s*async\\s*\\(`,
+      "g"
+    ),
+    replace: '$1app.get("/users", { onRequest: [app.authenticate] }, async (',
   },
 
+  // ── PRICE_MANIPULATION ─────────────────────────────────────────────────────
+  // Matches the destructure that pulls `price` from req.body in POST /orders.
   PRICE_MANIPULATION: {
-    description: "PRICE_MANIPULATION → server-side price on POST /orders",
-    search:
-`  // VULN-05: price from client body, never overridden server-side
-  app.post("/orders", { onRequest: [app.authenticate] }, async (req, reply) => {
-    const { product, price } = req.body as { product: string; price: number };
-    const user = req.user as { id: number };
-    const [order] = await db
-      .insert(orders)
-      .values({ userId: user.id, product, price })
-      .returning();`,
-    replace:
-`  // [PATCHED] Server-side price lookup — client price is ignored
-  app.post("/orders", { onRequest: [app.authenticate] }, async (req, reply) => {
-    const { product } = req.body as { product: string };
-    const CATALOGUE: Record<string, number> = { Widget: 9.99, Gadget: 49.99 };
-    const price = CATALOGUE[product] ?? 0;
-    if (price === 0) return reply.code(400).send({ error: "Unknown product" });
-    const user = req.user as { id: number };
-    const [order] = await db
-      .insert(orders)
-      .values({ userId: user.id, product, price })
-      .returning();`,
+    description: "PRICE_MANIPULATION → server-side price lookup in POST /orders",
+    pattern: new RegExp(
+      `([ \\t]*)const\\s*\\{\\s*product\\s*,\\s*price\\s*\\}` +
+      `\\s*=\\s*req\\.body\\s+as\\s*\\{[^}]+price\\s*:\\s*number[^}]*\\};`,
+      "gs"
+    ),
+    replace: [
+      "$1// [PATCHED] Server-side price lookup — client price is ignored",
+      "$1const { product } = req.body as { product: string };",
+      "$1const CATALOGUE: Record<string, number> = { Widget: 9.99, Gadget: 49.99 };",
+      "$1const price = CATALOGUE[product] ?? 0;",
+      "$1if (price === 0) return reply.code(400).send({ error: \"Unknown product\" });",
+    ].join("\n"),
   },
 
+  // ── INFO_DISCLOSURE ────────────────────────────────────────────────────────
+  // Matches db.select().from(users) with no column projection inside a GET /users handler.
+  // We look for the bare select() call — if a projection already exists (patched),
+  // the pattern won't match because select() won't be followed by .from() directly.
   INFO_DISCLOSURE: {
-    description: "INFO_DISCLOSURE → DTO projection on GET /users",
-    search:
-`    const allUsers = await db.select().from(users);
-    return reply.send(allUsers);
-  });
-
-  // ── Notes`,
-    replace:
-`    // [PATCHED] Project safe columns only — never expose password or apiKey
-    const allUsers = await db.select({
-      id:       users.id,
-      username: users.username,
-      isAdmin:  users.isAdmin,
-    }).from(users);
-    return reply.send(allUsers);
-  });
-
-  // ── Notes`,
+    description: "INFO_DISCLOSURE → safe column projection on GET /users",
+    pattern: new RegExp(
+      `([ \\t]*)const\\s+(\\w+)\\s*=\\s*await\\s+db\\.select\\(\\)\\.from\\(users\\);`,
+      "g"
+    ),
+    replace: [
+      "$1// [PATCHED] Project safe columns only — never expose password or apiKey",
+      "$1const $2 = await db.select({",
+      "$1  id:       users.id,",
+      "$1  username: users.username,",
+      "$1  isAdmin:  users.isAdmin,",
+      "$1}).from(users);",
+    ].join("\n"),
   },
 };
 
@@ -213,18 +229,34 @@ async function applyMutations(
   const applied: string[] = [];
   const skipped: string[] = [];
 
-  for (const cls of vulnClasses) {
+  // Expand MASS_ASSIGNMENT to also run the companion VALUES patch
+  const toApply = new Set(vulnClasses);
+  if (toApply.has("MASS_ASSIGNMENT")) toApply.add("MASS_ASSIGNMENT_VALUES");
+
+  for (const cls of toApply) {
     const mut = MUTATIONS[cls];
-    if (!mut) { skipped.push(`${cls} (no mutation registered)`); continue; }
-    if (!patched.includes(mut.search)) {
-      skipped.push(`${cls} (search text not found — may already be patched)`);
+    if (!mut) {
+      if (!cls.endsWith("_VALUES")) skipped.push(`${cls} (no mutation registered)`);
       continue;
     }
-    patched = patched.replace(mut.search, mut.replace);
-    applied.push(cls);
+    // Test whether the pattern matches before replacing
+    mut.pattern.lastIndex = 0;
+    if (!mut.pattern.test(patched)) {
+      mut.pattern.lastIndex = 0;
+      if (!cls.endsWith("_VALUES")) {
+        skipped.push(`${cls} (pattern did not match — may already be patched)`);
+      }
+      continue;
+    }
+    mut.pattern.lastIndex = 0;
+    patched = patched.replace(mut.pattern, mut.replace);
+    if (!cls.endsWith("_VALUES")) applied.push(cls);
   }
   return { patched, applied, skipped };
 }
+
+// Exported for testing
+export { applyMutations, MUTATIONS };
 
 // ── Phase 2b: Target server lifecycle ────────────────────────────────────────
 
@@ -392,4 +424,12 @@ async function main(): Promise<void> {
   process.exit(remaining === 0 ? 0 : 1);
 }
 
-await main();
+// ── Entrypoint guard ─────────────────────────────────────────────────────────
+// Only run when executed directly (npm run verify), not when imported by
+// ui-server.ts.  Mirrors the same guard used in orchestrator/index.ts.
+function _bn(p: string): string {
+  return p.replace(/\\/g, "/").split("/").pop()?.replace(/\.(js|ts)$/, "") ?? "";
+}
+if (_bn(import.meta.url) === _bn(process.argv[1] ?? "")) {
+  await main();
+}
